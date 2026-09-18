@@ -117,6 +117,28 @@ async function _getJwtViaApiToken(apiToken) {
 
 async function handleSign(body) {
   const { jwt, useApiToken, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
+  // ... (validation code)
+
+  // Use SDK's authenticateApiToken for server-side auth (cleaner than manual waas/authenticate REST).
+  const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
+  const client = new DynamicEvmWalletClient({ 
+    environmentId: ENVIRONMENT_ID,
+    baseApiUrl: 'https://app.dynamicauth.com/sdk',
+    enableMPCAccelerator: true,
+  });
+  
+  if (useApiToken) {
+    const apiToken = process.env.DYNAMIC_API_TOKEN;
+    if (!apiToken) {
+      throw { status: 500, code: 'config', message: 'DYNAMIC_API_TOKEN not configured' };
+    }
+    // SDK's native API token auth (not a manual REST exchange).
+    await client.authenticateApiToken(apiToken);
+  } else if (jwt) {
+    await client.authenticateJwt(jwt);
+  } else {
+    throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
+  }
   // Test-only escape hatch, gated by environment (never by request): lets us
   // verify the MPC ceremony against wallets with no ETH without funding them.
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
@@ -143,26 +165,7 @@ async function handleSign(body) {
     txData = data;
   }
 
-  let authJwt = jwt;
-  if (useApiToken) {
-    // Backend-initiated signing: get a JWT via Dynamic's waas/authenticate
-    // using the sidecar's API token, then use the standard SDK auth flow.
-    const apiToken = process.env.DYNAMIC_API_TOKEN;
-    if (!apiToken) throw { status: 500, code: 'no_api_token', message: 'DYNAMIC_API_TOKEN not configured' };
-    authJwt = await _getJwtViaApiToken(apiToken);
-  } else {
-    if (!authJwt || typeof authJwt !== 'string') {
-      throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
-    }
-  }
-
-  const client = new DynamicEvmWalletClient({ 
-    environmentId: ENVIRONMENT_ID,
-    // The SDK defaults to /api/v0/server/ path, but signMessage is at /sdk/.
-    // Per Dynamic's SDK source: POST https://app.dynamicauth.com/sdk/{envId}/waas/{walletId}/signMessage
-    baseApiUrl: 'https://app.dynamicauth.com/sdk',
-  });
-  await client.authenticateJwt(authJwt);
+  // (Auth already handled above via authenticateApiToken or authenticateJwt.)
 
   // Fetch full wallet metadata (incl. externalServerKeySharesBackupInfo, the
   // per-share pointers the MPC relay needs). The backend normally passes the
@@ -281,20 +284,31 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
+        const { ThresholdSignatureScheme } = require('@dynamic-labs-wallet/node');
         const client = new DynamicEvmWalletClient({ 
           environmentId: ENVIRONMENT_ID,
           baseApiUrl: 'https://app.dynamicauth.com/sdk',
+          enableMPCAccelerator: true,
         });
-        // Note: This uses the SDK's createWalletAccount. For server-side MPC
-        // wallets (required for /sign to work), use the server-side waas/create
-        // flow. See Dynamic docs for the correct endpoint.
+        // Authenticate with the API token (SDK native method).
+        const apiToken = process.env.DYNAMIC_API_TOKEN;
+        if (!apiToken) {
+          return send(res, 500, { ok: false, code: 'config', message: 'DYNAMIC_API_TOKEN not configured' });
+        }
+        await client.authenticateApiToken(apiToken);
+        // Create the wallet with server-side share backup enabled.
+        // backUpToClientShareService: true ensures Dynamic holds a share for MPC.
         const result = await client.createWalletAccount({
-          thresholdSignatureScheme: 'TWO_OF_TWO',
+          thresholdSignatureScheme: ThresholdSignatureScheme.TWO_OF_TWO,
+          backUpToClientShareService: true,
+          onError: (e) => console.error('[create-wallet] onError:', e.message),
         });
+        // The SDK returns walletId in different places depending on version.
+        const walletId = result.walletId || (result.walletMetadata && result.walletMetadata.id);
         return send(res, 200, { 
           ok: true, 
           address: result.accountAddress,
-          walletId: result.walletMetadata.id,
+          walletId: walletId,
           walletMetadata: result.walletMetadata,
           externalServerKeyShares: result.externalServerKeyShares,
           publicKeyHex: result.publicKeyHex,

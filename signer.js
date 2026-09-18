@@ -116,7 +116,7 @@ async function _getJwtViaApiToken(apiToken) {
 }
 
 async function handleSign(body) {
-  const { jwt, useApiToken, walletId, accountAddress, to, valueWei, data, walletMetadata: md } = body || {};
+  const { jwt, useApiToken, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
   // Test-only escape hatch, gated by environment (never by request): lets us
   // verify the MPC ceremony against wallets with no ETH without funding them.
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
@@ -221,7 +221,13 @@ async function handleSign(body) {
     gasPrice,
   };
 
-  const signedTransaction = await client.signTransaction({ walletMetadata, transaction });
+  const signedTransaction = await client.signTransaction({ 
+    walletMetadata, 
+    transaction,
+    // Pass the external server key shares for the MPC ceremony.
+    // These are the client-held shares from wallet creation.
+    ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
+  });
   const txHash = keccak256(signedTransaction);
   return {
     signedTransaction,

@@ -101,7 +101,13 @@ async function handleSign(body) {
   }
 
   const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
-  await client.authenticateJwt(jwt);
+  // Server-to-server calls (from the musemaxxing API) use the API token;
+  // direct client calls use a short-lived JWT.
+  if (body.useApiToken) {
+    await client.authenticateApiToken(DYNAMIC_API_TOKEN);
+  } else {
+    await client.authenticateJwt(jwt);
+  }
 
   // Fetch full wallet metadata (incl. externalServerKeySharesBackupInfo, the
   // per-share pointers the MPC relay needs). The backend normally passes the

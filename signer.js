@@ -221,13 +221,41 @@ async function handleSign(body) {
     gasPrice,
   };
 
-  const signedTransaction = await client.signTransaction({ 
-    walletMetadata, 
-    transaction,
-    // Pass the external server key shares for the MPC ceremony.
-    // These are the client-held shares from wallet creation.
-    ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
-  });
+  // Debug logging: log the transaction and wallet metadata (without sensitive shares).
+  console.log('[sign] transaction:', JSON.stringify({
+    chainId: transaction.chainId,
+    to: transaction.to,
+    value: transaction.value.toString(),
+    data: transaction.data,
+    nonce: transaction.nonce.toString(),
+    gas: transaction.gas.toString(),
+    gasPrice: transaction.gasPrice.toString(),
+  }));
+  console.log('[sign] walletId:', walletId, 'accountAddress:', accountAddress);
+  console.log('[sign] hasExternalShares:', !!externalServerKeyShares, 
+    'sharesType:', Array.isArray(externalServerKeyShares) ? `array[${externalServerKeyShares.length}]` : typeof externalServerKeyShares);
+
+  let signedTransaction;
+  try {
+    signedTransaction = await client.signTransaction({ 
+      walletMetadata, 
+      transaction,
+      // Pass the external server key shares for the MPC ceremony.
+      // These are the client-held shares from wallet creation.
+      ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
+    });
+  } catch (e) {
+    // Log the full error for debugging: the SDK often wraps the HTTP error.
+    console.error('[sign] signTransaction failed:', {
+      message: e.message,
+      code: e.code,
+      status: e.status || e.response?.status,
+      responseData: e.response?.data ? JSON.stringify(e.response.data).slice(0, 500) : undefined,
+      url: e.config?.url,
+      method: e.config?.method,
+    });
+    throw e;
+  }
   const txHash = keccak256(signedTransaction);
   return {
     signedTransaction,

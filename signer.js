@@ -37,6 +37,11 @@ if (!SIDECAR_TOKEN) {
   process.exit(1);
 }
 
+const DYNAMIC_API_TOKEN = process.env.DYNAMIC_API_TOKEN;
+// Required for POST /create-wallet (server wallet creation via SDK).
+// Signing via POST /sign uses short-lived JWTs passed per-request and does
+// not need the API token.
+
 const publicClient = createPublicClient({ transport: viemHttp(ROBINHOOD_RPC) });
 
 function timingSafeEqual(a, b) {
@@ -67,86 +72,14 @@ function isAddress(s) {
   return typeof s === 'string' && /^0x[0-9a-fA-F]{40}$/.test(s);
 }
 
-/**
- * Exchange a Dynamic API token for a JWT via waas/authenticate.
- * Used for backend-initiated signing where no user JWT is available.
- * 
- * Endpoint: POST https://app.dynamicauth.com/api/v0/environments/{envId}/waas/authenticate
- * The API token must have the 'waas.authenticate' scope (set in Dynamic dashboard).
- * Returns the JWT from encodedJwts.jwt.
- */
-async function _getJwtViaApiToken(apiToken) {
-  const https = require('https');
-  const envId = process.env.DYNAMIC_ENVIRONMENT_ID || '91d2182c-c794-4a7e-9c72-54ec2747d5cd';
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({});
-    const req = https.request({
-      hostname: 'app.dynamicauth.com',
-      path: `/api/v0/environments/${envId}/waas/authenticate`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiToken}`,
-        'Content-Length': Buffer.byteLength(data),
-      },
-    }, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(body);
-          // JWT is in encodedJwts.jwt per Dynamic docs.
-          const token = (json.encodedJwts && json.encodedJwts.jwt) || json.token || json.jwt;
-          if (!token) {
-            reject({ status: 500, code: 'auth_failed', message: `waas/authenticate did not return a token: ${body.slice(0, 300)}` });
-            return;
-          }
-          resolve(token);
-        } catch (e) {
-          reject({ status: 500, code: 'auth_failed', message: `waas/authenticate invalid response: ${body.slice(0, 300)}` });
-        }
-      });
-    });
-    req.on('error', (e) => {
-      reject({ status: 500, code: 'auth_failed', message: `waas/authenticate request failed: ${e.message}` });
-    });
-    req.write(data);
-    req.end();
-  });
-}
-
 async function handleSign(body) {
-  const { jwt, useApiToken, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
-  // ... (validation code)
-
-  // Use SDK's authenticateApiToken for server-side auth (cleaner than manual waas/authenticate REST).
-  const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
-  const client = new DynamicEvmWalletClient({ 
-    environmentId: ENVIRONMENT_ID,
-    enableMPCAccelerator: true,
-    // Do NOT override baseApiUrl — the SDK constructs correct paths internally:
-    // - Auth: https://app.dynamicauth.com/api/v0/environments/{envId}/waas/authenticate
-    // - Sign: https://app.dynamicauth.com/sdk/{envId}/waas/{walletId}/signMessage
-  });
-  
-  if (useApiToken) {
-    const apiToken = process.env.DYNAMIC_API_TOKEN;
-    if (!apiToken) {
-      throw { status: 500, code: 'config', message: 'DYNAMIC_API_TOKEN not configured' };
-    }
-    // SDK's native API token auth (not a manual REST exchange).
-    await client.authenticateApiToken(apiToken);
-  } else if (jwt) {
-    await client.authenticateJwt(jwt);
-  } else {
-    throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
-  }
+  const { jwt, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
   // Test-only escape hatch, gated by environment (never by request): lets us
   // verify the MPC ceremony against wallets with no ETH without funding them.
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
   const allowInsufficientFunds =
     process.env.ALLOW_TEST_SIGNING === 'true' && body && body.allowInsufficientFunds === true;
-  // JWT validation is handled below in the authJwt logic.
+  if (!jwt || typeof jwt !== 'string') throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
   if (!walletId || typeof walletId !== 'string') throw { status: 400, code: 'bad_wallet', message: 'walletId is required' };
   if (!isAddress(accountAddress)) throw { status: 400, code: 'bad_wallet', message: 'accountAddress must be a 0x address' };
   if (!isAddress(to)) throw { status: 400, code: 'bad_recipient', message: 'to must be a 0x address' };
@@ -167,7 +100,14 @@ async function handleSign(body) {
     txData = data;
   }
 
-  // (Auth already handled above via authenticateApiToken or authenticateJwt.)
+  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  // Server-to-server calls (from the musemaxxing API) use the API token;
+  // direct client calls use a short-lived JWT.
+  if (body.useApiToken) {
+    await client.authenticateApiToken(DYNAMIC_API_TOKEN);
+  } else {
+    await client.authenticateJwt(jwt);
+  }
 
   // Fetch full wallet metadata (incl. externalServerKeySharesBackupInfo, the
   // per-share pointers the MPC relay needs). The backend normally passes the
@@ -201,9 +141,11 @@ async function handleSign(body) {
     publicClient.getBalance({ address: accountAddress }),
   ]);
 
-  // 21000 for plain transfers; ERC-20 transfer costs ~50k. Estimate when calldata present.
-  let gasLimit = 21000n;
-  if (txData !== '0x') {
+  // Gas limit: estimate for all transactions (not just calldata).
+  // 21000 is only sufficient for EOA-to-EOA; contracts need more.
+  // Always estimating ensures correct gas for any recipient.
+  let gasLimit;
+  try {
     gasLimit = await publicClient.estimateGas({
       account: accountAddress,
       to,
@@ -211,6 +153,9 @@ async function handleSign(body) {
       data: txData,
     });
     gasLimit = (gasLimit * 120n) / 100n; // 20% headroom
+  } catch (e) {
+    // Fallback: 21000 for plain, 100k for contract calls (conservative).
+    gasLimit = txData === '0x' ? 21000n : 100000n;
   }
   const gasCost = gasLimit * gasPrice;
   const need = value + gasCost;
@@ -231,31 +176,14 @@ async function handleSign(body) {
     gasPrice,
   };
 
-  // Debug logging: log the transaction and wallet metadata (without sensitive shares).
-  console.log('[sign] transaction:', JSON.stringify({
-    chainId: transaction.chainId,
-    to: transaction.to,
-    value: transaction.value.toString(),
-    data: transaction.data,
-    nonce: transaction.nonce.toString(),
-    gas: transaction.gas.toString(),
-    gasPrice: transaction.gasPrice.toString(),
-  }));
-  console.log('[sign] walletId:', walletId, 'accountAddress:', accountAddress);
-  console.log('[sign] hasExternalShares:', !!externalServerKeyShares, 
-    'sharesType:', Array.isArray(externalServerKeyShares) ? `array[${externalServerKeyShares.length}]` : typeof externalServerKeyShares);
-
-  let signedTransaction;
-  try {
-    signedTransaction = await client.signTransaction({ 
-      walletMetadata, 
-      transaction,
-      ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
-    });
-  } catch (e) {
-    console.error('[sign] signTransaction failed:', e.message);
-    throw e;
-  }
+  // For SDK-created wallets, the backend passes the stored externalServerKeyShares
+  // directly (no CKS recovery needed). For REST-created wallets, shares is undefined
+  // and the SDK falls back to recovery (which fails for those wallets).
+  const signedTransaction = await client.signTransaction({
+    walletMetadata,
+    transaction,
+    ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
+  });
   const txHash = keccak256(signedTransaction);
   return {
     signedTransaction,
@@ -267,15 +195,47 @@ async function handleSign(body) {
   };
 }
 
+async function handleCreateWallet(body) {
+  if (!DYNAMIC_API_TOKEN) {
+    throw { status: 500, code: 'no_api_token', message: 'DYNAMIC_API_TOKEN is not configured on the sidecar' };
+  }
+  // label is informational only (e.g. agent id) for logging; not sent to Dynamic.
+  const { label } = body || {};
+
+  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  await client.authenticateApiToken(DYNAMIC_API_TOKEN);
+
+  // TWO_OF_TWO: our server holds one share (returned below), Dynamic holds the other.
+  // Neither share alone is a private key or can sign.
+  const { walletMetadata, publicKeyHex, externalServerKeyShares } =
+    await client.createWalletAccount({ thresholdSignatureScheme: 'TWO_OF_TWO' });
+
+  const accountAddress = walletMetadata.accountAddress || walletMetadata.address;
+  if (!isAddress(accountAddress)) {
+    throw { status: 500, code: 'no_address', message: 'SDK did not return a wallet address' };
+  }
+  return {
+    accountAddress,
+    walletId: walletMetadata.walletId || null,
+    // The backend persists walletMetadata + externalServerKeyShares (encrypted at rest)
+    // and passes them back on POST /sign. They are MPC shares, not a private key.
+    walletMetadata,
+    publicKeyHex: publicKeyHex || null,
+    externalServerKeyShares: externalServerKeyShares || null,
+    label: label || null,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       return send(res, 200, { ok: true, chainId: CHAIN_ID });
     }
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const authorized = timingSafeEqual(token, SIDECAR_TOKEN);
     if (req.method === 'POST' && req.url === '/create-wallet') {
-      const auth = req.headers.authorization || '';
-      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-      if (!timingSafeEqual(token, SIDECAR_TOKEN)) {
+      if (!authorized) {
         return send(res, 401, { ok: false, code: 'unauthorized', message: 'bad sidecar token' });
       }
       let body;
@@ -285,39 +245,11 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { ok: false, code: 'bad_json', message: 'invalid JSON body' });
       }
       try {
-        const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
-        const { ThresholdSignatureScheme } = require('@dynamic-labs-wallet/node');
-        const client = new DynamicEvmWalletClient({ 
-          environmentId: ENVIRONMENT_ID,
-          enableMPCAccelerator: true,
-          // Do NOT override baseApiUrl — SDK handles paths internally.
-        });
-        // Authenticate with the API token (SDK native method).
-        const apiToken = process.env.DYNAMIC_API_TOKEN;
-        if (!apiToken) {
-          return send(res, 500, { ok: false, code: 'config', message: 'DYNAMIC_API_TOKEN not configured' });
-        }
-        await client.authenticateApiToken(apiToken);
-        // Create the wallet with server-side share backup enabled.
-        // backUpToClientShareService: true ensures Dynamic holds a share for MPC.
-        const result = await client.createWalletAccount({
-          thresholdSignatureScheme: ThresholdSignatureScheme.TWO_OF_TWO,
-          backUpToClientShareService: true,
-          onError: (e) => console.error('[create-wallet] onError:', e.message),
-        });
-        // The SDK returns walletId in different places depending on version.
-        const walletId = result.walletId || (result.walletMetadata && result.walletMetadata.id);
-        return send(res, 200, { 
-          ok: true, 
-          address: result.accountAddress,
-          walletId: walletId,
-          walletMetadata: result.walletMetadata,
-          externalServerKeyShares: result.externalServerKeyShares,
-          publicKeyHex: result.publicKeyHex,
-        });
+        const result = await handleCreateWallet(body);
+        return send(res, 200, { ok: true, ...result });
       } catch (e) {
-        console.error('[create-wallet] failed:', e.message);
-        return send(res, 500, { ok: false, code: 'create_failed', message: e.message || String(e) });
+        const status = e.status || 500;
+        return send(res, status, { ok: false, code: e.code || 'create_failed', message: e.message || String(e) });
       }
     }
     if (req.method === 'POST' && req.url === '/sign') {

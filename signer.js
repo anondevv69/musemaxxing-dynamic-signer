@@ -70,14 +70,19 @@ function isAddress(s) {
 /**
  * Exchange a Dynamic API token for a JWT via waas/authenticate.
  * Used for backend-initiated signing where no user JWT is available.
+ * 
+ * Endpoint: POST https://app.dynamicauth.com/api/v0/environments/{envId}/waas/authenticate
+ * The API token must have the 'waas.authenticate' scope (set in Dynamic dashboard).
+ * Returns the JWT from encodedJwts.jwt.
  */
 async function _getJwtViaApiToken(apiToken) {
   const https = require('https');
+  const envId = process.env.DYNAMIC_ENVIRONMENT_ID || '91d2182c-c794-4a7e-9c72-54ec2747d5cd';
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({});
     const req = https.request({
-      hostname: 'app.dynamic.xyz',
-      path: '/api/v0/waas/authenticate',
+      hostname: 'app.dynamicauth.com',
+      path: `/api/v0/environments/${envId}/waas/authenticate`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -90,15 +95,15 @@ async function _getJwtViaApiToken(apiToken) {
       res.on('end', () => {
         try {
           const json = JSON.parse(body);
-          // The JWT might be in different fields depending on the API version.
-          const token = json.token || json.jwt || json.accessToken;
+          // JWT is in encodedJwts.jwt per Dynamic docs.
+          const token = (json.encodedJwts && json.encodedJwts.jwt) || json.token || json.jwt;
           if (!token) {
-            reject({ status: 500, code: 'auth_failed', message: `waas/authenticate did not return a token: ${body.slice(0, 200)}` });
+            reject({ status: 500, code: 'auth_failed', message: `waas/authenticate did not return a token: ${body.slice(0, 300)}` });
             return;
           }
           resolve(token);
         } catch (e) {
-          reject({ status: 500, code: 'auth_failed', message: `waas/authenticate invalid response: ${body.slice(0, 200)}` });
+          reject({ status: 500, code: 'auth_failed', message: `waas/authenticate invalid response: ${body.slice(0, 300)}` });
         }
       });
     });

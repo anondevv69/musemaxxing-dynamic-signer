@@ -235,70 +235,15 @@ async function handleSign(body) {
   console.log('[sign] hasExternalShares:', !!externalServerKeyShares, 
     'sharesType:', Array.isArray(externalServerKeyShares) ? `array[${externalServerKeyShares.length}]` : typeof externalServerKeyShares);
 
-  // Try direct REST to /signTransaction endpoint.
-  // The SDK's signTransaction() calls /signMessage which 400s on tx payloads.
-  // Based on Dynamic's API pattern, transaction signing has a dedicated endpoint.
-  console.log('[sign] attempting direct REST to /signTransaction');
-  
   let signedTransaction;
   try {
-    const https = require('https');
-    const envId = process.env.DYNAMIC_ENVIRONMENT_ID || '91d2182c-c794-4a7e-9c72-54ec2747d5cd';
-    
-    const postData = JSON.stringify({
-      transaction: {
-        to: to,
-        value: '0x' + value.toString(16),
-        data: txData,
-        nonce: '0x' + nonce.toString(16),
-        gasLimit: '0x' + gasLimit.toString(16),
-        gasPrice: '0x' + gasPrice.toString(16),
-        chainId: CHAIN_ID,
-      },
-    });
-    
-    console.log('[sign] POST data:', postData.slice(0, 300));
-    
-    signedTransaction = await new Promise((resolve, reject) => {
-      const req = https.request({
-        hostname: 'app.dynamicauth.com',
-        path: `/api/v0/server/${envId}/waas/${walletId}/signTransaction`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authJwt}`,
-          'Content-Length': Buffer.byteLength(postData),
-        },
-      }, (res) => {
-        let body = '';
-        res.on('data', chunk => body += chunk);
-        res.on('end', () => {
-          console.log('[sign] /signTransaction status:', res.statusCode, 'body:', body.slice(0, 500));
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            try {
-              const json = JSON.parse(body);
-              const signed = json.signedTransaction || json.signature || (json.data && json.data.signedTransaction);
-              if (signed) {
-                resolve(signed);
-              } else {
-                reject({ status: 500, code: 'sign_failed', message: `signTransaction: no signed tx in response` });
-              }
-            } catch (e) {
-              reject({ status: 500, code: 'sign_failed', message: `signTransaction: invalid JSON response` });
-            }
-          } else {
-            reject({ status: res.statusCode, code: 'sign_failed', message: `signTransaction HTTP ${res.statusCode}: ${body.slice(0, 300)}` });
-          }
-        });
-      });
-      req.on('error', (e) => {
-        reject({ status: 500, code: 'sign_failed', message: `signTransaction request failed: ${e.message}` });
-      });
-      req.write(postData);
-      req.end();
+    signedTransaction = await client.signTransaction({ 
+      walletMetadata, 
+      transaction,
+      ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
     });
   } catch (e) {
-    console.error('[sign] direct /signTransaction failed:', e.message);
+    console.error('[sign] signTransaction failed:', e.message);
     throw e;
   }
   const txHash = keccak256(signedTransaction);

@@ -37,6 +37,11 @@ if (!SIDECAR_TOKEN) {
   process.exit(1);
 }
 
+const DYNAMIC_API_TOKEN = process.env.DYNAMIC_API_TOKEN;
+// Required for POST /create-wallet (server wallet creation via SDK).
+// Signing via POST /sign uses short-lived JWTs passed per-request and does
+// not need the API token.
+
 const publicClient = createPublicClient({ transport: viemHttp(ROBINHOOD_RPC) });
 
 function timingSafeEqual(a, b) {
@@ -68,7 +73,7 @@ function isAddress(s) {
 }
 
 async function handleSign(body) {
-  const { jwt, walletId, accountAddress, to, valueWei, data, walletMetadata: md } = body || {};
+  const { jwt, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
   // Test-only escape hatch, gated by environment (never by request): lets us
   // verify the MPC ceremony against wallets with no ETH without funding them.
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
@@ -160,7 +165,14 @@ async function handleSign(body) {
     gasPrice,
   };
 
-  const signedTransaction = await client.signTransaction({ walletMetadata, transaction });
+  // For SDK-created wallets, the backend passes the stored externalServerKeyShares
+  // directly (no CKS recovery needed). For REST-created wallets, shares is undefined
+  // and the SDK falls back to recovery (which fails for those wallets).
+  const signedTransaction = await client.signTransaction({
+    walletMetadata,
+    transaction,
+    ...(externalServerKeyShares ? { externalServerKeyShares } : {}),
+  });
   const txHash = keccak256(signedTransaction);
   return {
     signedTransaction,
@@ -172,10 +184,62 @@ async function handleSign(body) {
   };
 }
 
+async function handleCreateWallet(body) {
+  if (!DYNAMIC_API_TOKEN) {
+    throw { status: 500, code: 'no_api_token', message: 'DYNAMIC_API_TOKEN is not configured on the sidecar' };
+  }
+  // label is informational only (e.g. agent id) for logging; not sent to Dynamic.
+  const { label } = body || {};
+
+  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  await client.authenticateApiToken(DYNAMIC_API_TOKEN);
+
+  // TWO_OF_TWO: our server holds one share (returned below), Dynamic holds the other.
+  // Neither share alone is a private key or can sign.
+  const { walletMetadata, publicKeyHex, externalServerKeyShares } =
+    await client.createWalletAccount({ thresholdSignatureScheme: 'TWO_OF_TWO' });
+
+  const accountAddress = walletMetadata.accountAddress || walletMetadata.address;
+  if (!isAddress(accountAddress)) {
+    throw { status: 500, code: 'no_address', message: 'SDK did not return a wallet address' };
+  }
+  return {
+    accountAddress,
+    walletId: walletMetadata.walletId || null,
+    // The backend persists walletMetadata + externalServerKeyShares (encrypted at rest)
+    // and passes them back on POST /sign. They are MPC shares, not a private key.
+    walletMetadata,
+    publicKeyHex: publicKeyHex || null,
+    externalServerKeyShares: externalServerKeyShares || null,
+    label: label || null,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       return send(res, 200, { ok: true, chainId: CHAIN_ID });
+    }
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const authorized = timingSafeEqual(token, SIDECAR_TOKEN);
+    if (req.method === 'POST' && req.url === '/create-wallet') {
+      if (!authorized) {
+        return send(res, 401, { ok: false, code: 'unauthorized', message: 'bad sidecar token' });
+      }
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        return send(res, 400, { ok: false, code: 'bad_json', message: 'invalid JSON body' });
+      }
+      try {
+        const result = await handleCreateWallet(body);
+        return send(res, 200, { ok: true, ...result });
+      } catch (e) {
+        const status = e.status || 500;
+        return send(res, status, { ok: false, code: e.code || 'create_failed', message: e.message || String(e) });
+      }
     }
     if (req.method === 'POST' && req.url === '/sign') {
       const auth = req.headers.authorization || '';

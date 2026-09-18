@@ -267,6 +267,43 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       return send(res, 200, { ok: true, chainId: CHAIN_ID });
     }
+    if (req.method === 'POST' && req.url === '/create-wallet') {
+      const auth = req.headers.authorization || '';
+      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      if (!timingSafeEqual(token, SIDECAR_TOKEN)) {
+        return send(res, 401, { ok: false, code: 'unauthorized', message: 'bad sidecar token' });
+      }
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        return send(res, 400, { ok: false, code: 'bad_json', message: 'invalid JSON body' });
+      }
+      try {
+        const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
+        const client = new DynamicEvmWalletClient({ 
+          environmentId: ENVIRONMENT_ID,
+          baseApiUrl: 'https://app.dynamicauth.com/sdk',
+        });
+        // Note: This uses the SDK's createWalletAccount. For server-side MPC
+        // wallets (required for /sign to work), use the server-side waas/create
+        // flow. See Dynamic docs for the correct endpoint.
+        const result = await client.createWalletAccount({
+          thresholdSignatureScheme: 'TWO_OF_TWO',
+        });
+        return send(res, 200, { 
+          ok: true, 
+          address: result.accountAddress,
+          walletId: result.walletMetadata.id,
+          walletMetadata: result.walletMetadata,
+          externalServerKeyShares: result.externalServerKeyShares,
+          publicKeyHex: result.publicKeyHex,
+        });
+      } catch (e) {
+        console.error('[create-wallet] failed:', e.message);
+        return send(res, 500, { ok: false, code: 'create_failed', message: e.message || String(e) });
+      }
+    }
     if (req.method === 'POST' && req.url === '/sign') {
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';

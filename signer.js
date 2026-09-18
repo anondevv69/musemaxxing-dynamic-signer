@@ -67,6 +67,49 @@ function isAddress(s) {
   return typeof s === 'string' && /^0x[0-9a-fA-F]{40}$/.test(s);
 }
 
+/**
+ * Exchange a Dynamic API token for a JWT via waas/authenticate.
+ * Used for backend-initiated signing where no user JWT is available.
+ */
+async function _getJwtViaApiToken(apiToken) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({});
+    const req = https.request({
+      hostname: 'app.dynamic.xyz',
+      path: '/api/v0/waas/authenticate',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiToken}`,
+        'Content-Length': Buffer.byteLength(data),
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          // The JWT might be in different fields depending on the API version.
+          const token = json.token || json.jwt || json.accessToken;
+          if (!token) {
+            reject({ status: 500, code: 'auth_failed', message: `waas/authenticate did not return a token: ${body.slice(0, 200)}` });
+            return;
+          }
+          resolve(token);
+        } catch (e) {
+          reject({ status: 500, code: 'auth_failed', message: `waas/authenticate invalid response: ${body.slice(0, 200)}` });
+        }
+      });
+    });
+    req.on('error', (e) => {
+      reject({ status: 500, code: 'auth_failed', message: `waas/authenticate request failed: ${e.message}` });
+    });
+    req.write(data);
+    req.end();
+  });
+}
+
 async function handleSign(body) {
   const { jwt, useApiToken, walletId, accountAddress, to, valueWei, data, walletMetadata: md } = body || {};
   // Test-only escape hatch, gated by environment (never by request): lets us
@@ -74,11 +117,7 @@ async function handleSign(body) {
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
   const allowInsufficientFunds =
     process.env.ALLOW_TEST_SIGNING === 'true' && body && body.allowInsufficientFunds === true;
-  // JWT is required unless the caller uses API token auth (backend passes useApiToken=true,
-  // sidecar authenticates with its own Dynamic API token).
-  if (!useApiToken) {
-    if (!jwt || typeof jwt !== 'string') throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
-  }
+  // JWT validation is handled below in the authJwt logic.
   if (!walletId || typeof walletId !== 'string') throw { status: 400, code: 'bad_wallet', message: 'walletId is required' };
   if (!isAddress(accountAddress)) throw { status: 400, code: 'bad_wallet', message: 'accountAddress must be a 0x address' };
   if (!isAddress(to)) throw { status: 400, code: 'bad_recipient', message: 'to must be a 0x address' };
@@ -99,17 +138,21 @@ async function handleSign(body) {
     txData = data;
   }
 
-  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  let authJwt = jwt;
   if (useApiToken) {
-    // Authenticate with the sidecar's own Dynamic API token (for backend-initiated signing).
-    // The SDK supports API token auth via the client's configuration.
+    // Backend-initiated signing: get a JWT via Dynamic's waas/authenticate
+    // using the sidecar's API token, then use the standard SDK auth flow.
     const apiToken = process.env.DYNAMIC_API_TOKEN;
     if (!apiToken) throw { status: 500, code: 'no_api_token', message: 'DYNAMIC_API_TOKEN not configured' };
-    // Use the API token to authenticate — the SDK will handle the waas/authenticate flow.
-    await client.authenticateWithApiToken(apiToken);
+    authJwt = await _getJwtViaApiToken(apiToken);
   } else {
-    await client.authenticateJwt(jwt);
+    if (!authJwt || typeof authJwt !== 'string') {
+      throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
+    }
   }
+
+  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  await client.authenticateJwt(authJwt);
 
   // Fetch full wallet metadata (incl. externalServerKeySharesBackupInfo, the
   // per-share pointers the MPC relay needs). The backend normally passes the

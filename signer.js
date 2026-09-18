@@ -123,8 +123,10 @@ async function handleSign(body) {
   const { DynamicEvmWalletClient } = require('@dynamic-labs-wallet/node-evm');
   const client = new DynamicEvmWalletClient({ 
     environmentId: ENVIRONMENT_ID,
-    baseApiUrl: 'https://app.dynamicauth.com/sdk',
     enableMPCAccelerator: true,
+    // Do NOT override baseApiUrl — the SDK constructs correct paths internally:
+    // - Auth: https://app.dynamicauth.com/api/v0/environments/{envId}/waas/authenticate
+    // - Sign: https://app.dynamicauth.com/sdk/{envId}/waas/{walletId}/signMessage
   });
   
   if (useApiToken) {
@@ -287,8 +289,8 @@ const server = http.createServer(async (req, res) => {
         const { ThresholdSignatureScheme } = require('@dynamic-labs-wallet/node');
         const client = new DynamicEvmWalletClient({ 
           environmentId: ENVIRONMENT_ID,
-          baseApiUrl: 'https://app.dynamicauth.com/sdk',
           enableMPCAccelerator: true,
+          // Do NOT override baseApiUrl — SDK handles paths internally.
         });
         // Authenticate with the API token (SDK native method).
         const apiToken = process.env.DYNAMIC_API_TOKEN;

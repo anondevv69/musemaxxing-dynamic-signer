@@ -74,12 +74,14 @@ function isAddress(s) {
 
 async function handleSign(body) {
   const { jwt, walletId, accountAddress, to, valueWei, data, walletMetadata: md, externalServerKeyShares } = body || {};
+  const useApiToken = body && body.useApiToken === true;
   // Test-only escape hatch, gated by environment (never by request): lets us
   // verify the MPC ceremony against wallets with no ETH without funding them.
   // Production sets ALLOW_TEST_SIGNING=false (default); the request flag is ignored.
   const allowInsufficientFunds =
     process.env.ALLOW_TEST_SIGNING === 'true' && body && body.allowInsufficientFunds === true;
-  if (!jwt || typeof jwt !== 'string') throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
+  // JWT required only when NOT using API token auth (server-to-server).
+  if (!useApiToken && (!jwt || typeof jwt !== 'string')) throw { status: 400, code: 'bad_jwt', message: 'jwt is required' };
   if (!walletId || typeof walletId !== 'string') throw { status: 400, code: 'bad_wallet', message: 'walletId is required' };
   if (!isAddress(accountAddress)) throw { status: 400, code: 'bad_wallet', message: 'accountAddress must be a 0x address' };
   if (!isAddress(to)) throw { status: 400, code: 'bad_recipient', message: 'to must be a 0x address' };
@@ -100,10 +102,17 @@ async function handleSign(body) {
     txData = data;
   }
 
-  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  const client = new DynamicEvmWalletClient({
+    environmentId: ENVIRONMENT_ID,
+    enableMPCAccelerator: true,
+  });
   // Server-to-server calls (from the musemaxxing API) use the API token;
   // direct client calls use a short-lived JWT.
-  if (body.useApiToken) {
+  // (Ported from 6af1b33: SDK-native authenticateApiToken, no manual waas/authenticate REST.)
+  if (useApiToken) {
+    if (!DYNAMIC_API_TOKEN) {
+      throw { status: 500, code: 'config', message: 'DYNAMIC_API_TOKEN not configured' };
+    }
     await client.authenticateApiToken(DYNAMIC_API_TOKEN);
   } else {
     await client.authenticateJwt(jwt);

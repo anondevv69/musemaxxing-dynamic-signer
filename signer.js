@@ -156,7 +156,12 @@ async function handleSign(body) {
     }
   }
 
-  const client = new DynamicEvmWalletClient({ environmentId: ENVIRONMENT_ID });
+  const client = new DynamicEvmWalletClient({ 
+    environmentId: ENVIRONMENT_ID,
+    // The SDK defaults to /api/v0/server/ path, but signMessage is at /sdk/.
+    // Per Dynamic's SDK source: POST https://app.dynamicauth.com/sdk/{envId}/waas/{walletId}/signMessage
+    baseApiUrl: 'https://app.dynamicauth.com/sdk',
+  });
   await client.authenticateJwt(authJwt);
 
   // Fetch full wallet metadata (incl. externalServerKeySharesBackupInfo, the
